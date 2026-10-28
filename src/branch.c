@@ -477,6 +477,101 @@ cleanup:
 	return error;
 }
 
+/* Resolve the push remote the way git does: branch.<name>.pushRemote, then
+ * remote.pushDefault, then branch.<name>.remote, then the only remote, then
+ * origin. */
+static int push_remote_name(
+	git_buf *out,
+	git_config *config,
+	git_repository *repo,
+	const char *refname)
+{
+	git_strarray remotes = {0};
+	int error;
+
+	if ((error = retrieve_upstream_configuration(
+		    out, config, refname, "branch.%s.pushremote")) != GIT_ENOTFOUND)
+		return error;
+
+	if ((error = git_config_get_string_buf(
+		    out, config, "remote.pushdefault")) != GIT_ENOTFOUND)
+		return error;
+
+	if ((error = retrieve_upstream_configuration(
+		    out, config, refname, "branch.%s.remote")) != GIT_ENOTFOUND)
+		return error;
+
+	git_error_clear();
+
+	if ((error = git_remote_list(&remotes, repo)) < 0)
+		return error;
+
+	error = git_buf_sets(out, remotes.count == 1 ? remotes.strings[0] : GIT_REMOTE_ORIGIN);
+	git_strarray_dispose(&remotes);
+	return error;
+}
+
+/* Map a ref name on the remote to its remote-tracking ref via the fetch refspecs. */
+static int push_tracking_ref(git_buf *out, git_remote *remote, const char *dst)
+{
+	const git_refspec *refspec;
+
+	if (!remote)
+		return git_buf_sets(out, dst);
+
+	if (!(refspec = git_remote__matching_refspec(remote, dst))) {
+		git_error_set(GIT_ERROR_REFERENCE,
+			"push destination '%s' on remote '%s' has no local tracking branch",
+			dst, remote->name);
+		return GIT_ENOTFOUND;
+	}
+
+	return git_refspec_transform(out, refspec, dst);
+}
+
+static int push_tracking_ref_from_push_refspecs(
+	git_buf *out,
+	bool *found,
+	git_remote *remote,
+	const char *refname)
+{
+	git_buf dst = GIT_BUF_INIT;
+	const git_refspec *refspec;
+	size_t i;
+	int error;
+
+	*found = false;
+
+	git_vector_foreach(&remote->refspecs, i, refspec) {
+		if (refspec->push) {
+			*found = true;
+			if (git_refspec_src_matches(refspec, refname))
+				break;
+		}
+	}
+
+	if (!*found)
+		return 0;
+
+	if (i == remote->refspecs.length) {
+		git_error_set(GIT_ERROR_REFERENCE,
+			"push refspecs for '%s' do not include '%s'", remote->name, refname);
+		return GIT_ENOTFOUND;
+	}
+
+	if (!refspec->dst)
+		error = git_buf_sets(&dst, refname);
+	else
+		error = git_refspec_transform(&dst, refspec, refname);
+
+	if (!error)
+		error = push_tracking_ref(out, remote, git_buf_cstr(&dst));
+
+	git_buf_dispose(&dst);
+	return error;
+}
+
+/* The same as `git rev-parse --symbolic-full-name <branch>@{push}`. */
 int git_branch_push_remote(
 	git_remote** remote_out,
 	git_buf* name_out,
@@ -484,10 +579,14 @@ int git_branch_push_remote(
 	const char *refname)
 {
 	git_buf remote_name = GIT_BUF_INIT;
+	git_buf push_default = GIT_BUF_INIT;
+	git_buf mirror_key = GIT_BUF_INIT;
+	git_buf upstream = GIT_BUF_INIT;
 	git_buf buf = GIT_BUF_INIT;
 	int error = -1;
+	int mirror = 0;
+	bool found;
 	git_remote *remote = NULL;
-	const git_refspec *refspec;
 	git_config *config;
 
 	assert(remote_out && name_out && repo && refname);
@@ -500,10 +599,7 @@ int git_branch_push_remote(
 	if ((error = git_repository_config(&config, repo)) < 0)
 		return error;
 
-	if ((error = retrieve_upstream_configuration(
-		    &remote_name, config, refname, "branch.%s.pushremote")) < 0 &&
-      (error = git_config_get_string_buf(
-		    &remote_name, config, "remote.pushdefault")) < 0)
+	if ((error = push_remote_name(&remote_name, config, repo, refname)) < 0)
 		goto cleanup;
 
 	if (git_buf_len(&remote_name) == 0) {
@@ -517,17 +613,55 @@ int git_branch_push_remote(
 		if ((error = git_remote_lookup(&remote, repo, git_buf_cstr(&remote_name))) < 0)
 			goto cleanup;
 
-		refspec = git_remote__matching_refspec(remote, refname);
-		if (!refspec) {
-			error = GIT_ENOTFOUND;
-			goto cleanup;
-		}
+		if ((error = push_tracking_ref_from_push_refspecs(&buf, &found, remote, refname)) < 0 ||
+		    found)
+			goto done;
 
-		if ((error = git_refspec_transform(&buf, refspec, refname)) < 0)
+		if ((error = git_buf_printf(&mirror_key, "remote.%s.mirror", remote->name)) < 0)
 			goto cleanup;
-	} else
-		if ((error = git_buf_sets(&buf, refname)) < 0)
+
+		if ((error = git_config_get_bool(&mirror, config, git_buf_cstr(&mirror_key))) < 0 &&
+		    error != GIT_ENOTFOUND)
 			goto cleanup;
+
+		if (mirror) {
+			error = push_tracking_ref(&buf, remote, refname);
+			goto done;
+		}
+	}
+
+	if ((error = git_config_get_string_buf(&push_default, config, "push.default")) < 0) {
+		if (error != GIT_ENOTFOUND)
+			goto cleanup;
+		git_error_clear();
+		error = git_buf_sets(&push_default, "simple");
+	}
+
+	if (!strcmp(git_buf_cstr(&push_default), "nothing")) {
+		git_error_set(GIT_ERROR_REFERENCE,
+			"push has no destination (push.default is 'nothing')");
+		error = GIT_ENOTFOUND;
+	} else if (!strcmp(git_buf_cstr(&push_default), "matching") ||
+	           !strcmp(git_buf_cstr(&push_default), "current")) {
+		error = push_tracking_ref(&buf, remote, refname);
+	} else if (!strcmp(git_buf_cstr(&push_default), "upstream") ||
+	           !strcmp(git_buf_cstr(&push_default), "tracking")) {
+		error = git_branch_upstream_name(&buf, repo, refname);
+	} else {
+		/* simple */
+		if ((error = git_branch_upstream_name(&upstream, repo, refname)) < 0 ||
+		    (error = push_tracking_ref(&buf, remote, refname)) < 0)
+			goto cleanup;
+		if (strcmp(git_buf_cstr(&buf), git_buf_cstr(&upstream))) {
+			git_error_set(GIT_ERROR_REFERENCE,
+				"cannot resolve 'simple' push to a single destination");
+			error = GIT_ENOTFOUND;
+		}
+	}
+
+done:
+	if (error < 0)
+		goto cleanup;
 
 	if ((error = git_buf_set(name_out, git_buf_cstr(&buf), git_buf_len(&buf))) < 0)
 		goto cleanup;
@@ -539,6 +673,9 @@ cleanup:
 	git_config_free(config);
 	git_remote_free(remote);
 	git_buf_dispose(&remote_name);
+	git_buf_dispose(&push_default);
+	git_buf_dispose(&mirror_key);
+	git_buf_dispose(&upstream);
 	git_buf_dispose(&buf);
 	return error;
 }

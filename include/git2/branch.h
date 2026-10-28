@@ -197,7 +197,7 @@ GIT_EXTERN(int) git_branch_remote(
 	git_repository *repo,
 	const char *refname);
 
-/* the same as remote_out but for branch.<name>.pushRemote */
+/* the same as git_branch_remote but for <branch>@{push} */
 GIT_EXTERN(int) git_branch_push_remote(
 	git_remote** remote_out,
 	git_buf* name_out,
